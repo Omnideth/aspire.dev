@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using GitHubJwt;
 using Microsoft.Extensions.Options;
 using Octokit;
@@ -15,6 +16,7 @@ internal sealed class GitHubArtifactClient(IOptions<PreviewHostOptions> options,
     };
 
     private static readonly TimeSpan DownloadProgressPublishInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan OpenPullRequestCatalogCacheDuration = TimeSpan.FromSeconds(30);
     private const string CiWorkflowPath = ".github/workflows/ci.yml";
     private const string DefaultPreviewArtifactName = "frontend-dist";
     private readonly SemaphoreSlim _installationTokenGate = new(1, 1);
@@ -148,10 +150,15 @@ internal sealed class GitHubArtifactClient(IOptions<PreviewHostOptions> options,
                 }
             }
 
+            var previewablePullRequests = await GetPullRequestNumbersWithSuccessfulPreviewBuildsAsync(
+                repositoryClient,
+                pullRequests,
+                cancellationToken);
+
             _cachedOpenPullRequests = [.. pullRequests
                 .OrderByDescending(static pullRequest => pullRequest.CreatedAt)
                 .ThenByDescending(static pullRequest => pullRequest.Number)
-                .Select(static pullRequest => new GitHubPullRequestSummary(
+                .Select(pullRequest => new GitHubPullRequestSummary(
                     pullRequest.Number,
                     pullRequest.Title,
                     pullRequest.HtmlUrl,
@@ -159,9 +166,10 @@ internal sealed class GitHubArtifactClient(IOptions<PreviewHostOptions> options,
                     pullRequest.User?.Login,
                     pullRequest.Draft,
                     pullRequest.CreatedAt,
-                    pullRequest.UpdatedAt))];
+                    pullRequest.UpdatedAt,
+                    previewablePullRequests.Contains(pullRequest.Number)))];
 
-            _cachedOpenPullRequestsExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(15);
+            _cachedOpenPullRequestsExpiresAtUtc = DateTimeOffset.UtcNow.Add(OpenPullRequestCatalogCacheDuration);
             return _cachedOpenPullRequests;
         }
         finally
@@ -323,14 +331,134 @@ internal sealed class GitHubArtifactClient(IOptions<PreviewHostOptions> options,
             SinglePageApiOptions);
 
         return payload.WorkflowRuns
-            .Where(static run => string.Equals(run.Conclusion?.StringValue, "success", StringComparison.OrdinalIgnoreCase))
-            .Where(run =>
-                string.Equals(run.Path, CiWorkflowPath, StringComparison.Ordinal)
-                || string.Equals(run.Name, "CI", StringComparison.Ordinal))
+            .Where(IsSuccessfulPreviewRun)
             .OrderByDescending(static run => run.RunAttempt)
             .ThenByDescending(static run => run.UpdatedAt)
             .ThenByDescending(static run => run.Id)
             .FirstOrDefault();
+    }
+
+    private async Task<HashSet<int>> GetPullRequestNumbersWithSuccessfulPreviewBuildsAsync(
+        GitHubClient repositoryClient,
+        IReadOnlyList<PullRequest> pullRequests,
+        CancellationToken cancellationToken)
+    {
+        var headShas = pullRequests
+            .Select(static pullRequest => pullRequest.Head?.Sha)
+            .OfType<string>()
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (headShas.Length == 0)
+        {
+            return [];
+        }
+
+        var latestRunsByHeadSha = await GetLatestSuccessfulPreviewRunsByHeadShaAsync(
+            repositoryClient,
+            _options.RepositoryOwner,
+            _options.RepositoryName,
+            headShas,
+            cancellationToken);
+
+        if (latestRunsByHeadSha.Count == 0)
+        {
+            return [];
+        }
+
+        var previewablePullRequests = new ConcurrentDictionary<int, byte>();
+
+        await Parallel.ForEachAsync(
+            pullRequests,
+            new ParallelOptions
+            {
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = 4
+            },
+            async (pullRequest, ct) =>
+            {
+                var headSha = pullRequest.Head?.Sha;
+                if (string.IsNullOrWhiteSpace(headSha)
+                    || !latestRunsByHeadSha.TryGetValue(headSha, out var workflowRun))
+                {
+                    return;
+                }
+
+                var artifacts = await GetArtifactsAsync(
+                    repositoryClient,
+                    _options.RepositoryOwner,
+                    _options.RepositoryName,
+                    workflowRun.Id,
+                    ct);
+
+                if (ResolvePreviewArtifact(artifacts.Artifacts, pullRequest.Number) is not null)
+                {
+                    previewablePullRequests.TryAdd(pullRequest.Number, 0);
+                }
+            });
+
+        return [.. previewablePullRequests.Keys];
+    }
+
+    private static async Task<Dictionary<string, WorkflowRun>> GetLatestSuccessfulPreviewRunsByHeadShaAsync(
+        GitHubClient repositoryClient,
+        string repositoryOwner,
+        string repositoryName,
+        IReadOnlyCollection<string> headShas,
+        CancellationToken cancellationToken)
+    {
+        var remainingHeadShas = headShas
+            .Where(static headSha => !string.IsNullOrWhiteSpace(headSha))
+            .ToHashSet(StringComparer.Ordinal);
+        var workflowRunsByHeadSha = new Dictionary<string, WorkflowRun>(StringComparer.Ordinal);
+
+        if (remainingHeadShas.Count == 0)
+        {
+            return workflowRunsByHeadSha;
+        }
+
+        for (var page = 1; remainingHeadShas.Count > 0; page++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var payload = await repositoryClient.Actions.Workflows.Runs.List(
+                repositoryOwner,
+                repositoryName,
+                new WorkflowRunsRequest
+                {
+                    Event = "pull_request",
+                    Status = CheckRunStatusFilter.Completed
+                },
+                new ApiOptions
+                {
+                    StartPage = page,
+                    PageCount = 1,
+                    PageSize = 100
+                });
+
+            if (payload.WorkflowRuns.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var workflowRun in payload.WorkflowRuns.Where(IsSuccessfulPreviewRun))
+            {
+                if (string.IsNullOrWhiteSpace(workflowRun.HeadSha)
+                    || !remainingHeadShas.Remove(workflowRun.HeadSha))
+                {
+                    continue;
+                }
+
+                workflowRunsByHeadSha[workflowRun.HeadSha] = workflowRun;
+            }
+
+            if (payload.WorkflowRuns.Count < 100)
+            {
+                break;
+            }
+        }
+
+        return workflowRunsByHeadSha;
     }
 
     private async Task<GitHubClient> CreateRepositoryClientAsync(
@@ -465,6 +593,11 @@ internal sealed class GitHubArtifactClient(IOptions<PreviewHostOptions> options,
 
         return null;
     }
+
+    private static bool IsSuccessfulPreviewRun(WorkflowRun run) =>
+        string.Equals(run.Conclusion?.StringValue, "success", StringComparison.OrdinalIgnoreCase)
+        && (string.Equals(run.Path, CiWorkflowPath, StringComparison.Ordinal)
+            || string.Equals(run.Name, "CI", StringComparison.Ordinal));
 
     private sealed class DownloadProgressPublisher : IAsyncDisposable
     {

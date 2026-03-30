@@ -120,6 +120,40 @@ internal sealed class PreviewCoordinator(
         return snapshot;
     }
 
+    public async Task<bool> ResetAsync(int pullRequestNumber, CancellationToken cancellationToken)
+    {
+        var snapshot = await _stateStore.GetSnapshotAsync(pullRequestNumber, cancellationToken);
+        if (snapshot is null)
+        {
+            return false;
+        }
+
+        if (_activeLoadCancellations.TryGetValue(pullRequestNumber, out var cancellationSource))
+        {
+            cancellationSource.Cancel();
+        }
+
+        if (_activeLoads.TryGetValue(pullRequestNumber, out var activeLoad))
+        {
+            try
+            {
+                await activeLoad.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogDebug(exception, "Preview load task ended while resetting PR #{PullRequestNumber}", pullRequestNumber);
+            }
+        }
+
+        await _stateStore.RemoveAsync(pullRequestNumber, cancellationToken);
+        _logger.LogInformation("Reset preview for PR #{PullRequestNumber}", pullRequestNumber);
+        return true;
+    }
+
     public async Task<PreviewDiscoveryResult> EnsureRegisteredAsync(int pullRequestNumber, CancellationToken cancellationToken)
     {
         var existingSnapshot = await _stateStore.GetSnapshotAsync(pullRequestNumber, cancellationToken);

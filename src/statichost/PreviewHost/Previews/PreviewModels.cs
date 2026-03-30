@@ -280,4 +280,5 @@ internal sealed record GitHubPullRequestSummary(
     string? AuthorLogin,
     bool IsDraft,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset UpdatedAtUtc);
+    DateTimeOffset UpdatedAtUtc,
+    bool HasSuccessfulPreviewBuild);

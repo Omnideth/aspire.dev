@@ -35,8 +35,26 @@
     <section class="collection-controls" aria-label="Catalog filters">
       <div class="filter-stack">
         <span class="filter-label">Authors</span>
-        <div id="author-filter-bar" class="filter-pills" aria-busy="true">
-          <span class="filter-pill filter-pill-loading">Loading authors...</span>
+        <div id="author-filter-bar" class="filter-dropdown" aria-busy="true">
+          <button type="button" class="filter-trigger filter-trigger-loading" aria-expanded="false" disabled>
+            <span class="filter-trigger-copy">
+              <span class="filter-trigger-value">Loading authors...</span>
+              <span class="filter-trigger-meta">Fetching open pull request authors</span>
+            </span>
+            <span class="filter-trigger-icon" aria-hidden="true"></span>
+          </button>
+        </div>
+      </div>
+      <div class="filter-stack">
+        <span class="filter-label">Preview status</span>
+        <div id="availability-filter-bar" class="filter-dropdown" aria-busy="true">
+          <button type="button" class="filter-trigger filter-trigger-loading" aria-expanded="false" disabled>
+            <span class="filter-trigger-copy">
+              <span class="filter-trigger-value">Loading status filter...</span>
+              <span class="filter-trigger-meta">Fetching preview availability</span>
+            </span>
+            <span class="filter-trigger-icon" aria-hidden="true"></span>
+          </button>
         </div>
       </div>
     </section>

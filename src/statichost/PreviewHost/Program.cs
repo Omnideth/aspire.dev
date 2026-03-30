@@ -141,6 +141,7 @@ app.MapGet(
                 authorLogin = pullRequest.AuthorLogin,
                 isDraft = pullRequest.IsDraft,
                 headSha = pullRequest.HeadSha,
+                hasSuccessfulPreviewBuild = pullRequest.HasSuccessfulPreviewBuild,
                 createdAtUtc = pullRequest.CreatedAtUtc,
                 updatedAtUtc = pullRequest.UpdatedAtUtc,
                 preview = trackedSnapshots.TryGetValue(pullRequest.PullRequestNumber, out var snapshot) ? snapshot : null
@@ -151,6 +152,7 @@ app.MapGet(
         {
             updatedAtUtc = DateTimeOffset.UtcNow,
             openPullRequestCount = entries.Length,
+            previewablePullRequestCount = entries.Count(static entry => entry.hasSuccessfulPreviewBuild),
             maxActivePreviews = options.Value.MaxActivePreviews,
             activePreviewCount,
             entries
@@ -255,6 +257,16 @@ app.MapPost(
                 options.Value,
                 result.FailureMessage ?? "The preview host could not find a successful frontend build for this pull request yet."))
             : Results.Json(result.Snapshot);
+    });
+
+app.MapPost(
+    "/api/previews/{pullRequestNumber:int}/reset",
+    async (int pullRequestNumber, PreviewCoordinator coordinator, CancellationToken cancellationToken) =>
+    {
+        var removed = await coordinator.ResetAsync(pullRequestNumber, cancellationToken);
+        return removed
+            ? Results.NoContent()
+            : Results.NotFound();
     });
 
 app.MapPost(
